@@ -47,7 +47,8 @@ object AlertEngine {
                 emit(SignalAlert.SignalWeak(dbm = data.dbm))
             }
             SignalZone.STRONG -> {
-                if (consecutiveDead >= 3) emit(SignalAlert.SignalRestored())
+                // Clear any previous alert when signal is strong
+                emit(SignalAlert.SignalRestored())
             }
             SignalZone.UNKNOWN -> {}
         }

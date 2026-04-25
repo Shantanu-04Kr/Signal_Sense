@@ -6,6 +6,7 @@ object ZoneClassifier {
 
     fun classify(data: SignalData): SignalZone {
         if (!data.isValid) return SignalZone.UNKNOWN
+        if (data.dbm == Int.MIN_VALUE) return SignalZone.UNKNOWN
 
         val dbmScore  = scoreDbm(data.dbm, data.networkLabel)
         val sinrScore = if (!data.sinr.isNaN()) scoreSinr(data.sinr, data.networkLabel) else null
