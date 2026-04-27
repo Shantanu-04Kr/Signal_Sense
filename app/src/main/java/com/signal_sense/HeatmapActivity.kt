@@ -1,5 +1,6 @@
 package com.signal_sense
 
+import android.annotation.SuppressLint
 import android.os.Bundle
 import android.preference.PreferenceManager
 import androidx.activity.ComponentActivity
@@ -21,7 +22,10 @@ import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
+import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 
 class HeatmapActivity : ComponentActivity() {
 
@@ -43,12 +47,16 @@ class HeatmapActivity : ComponentActivity() {
         setContent { HeatmapScreen() }
     }
 
+    @SuppressLint("MissingPermission")
     @Composable
     fun HeatmapScreen() {
-        var readings by remember { mutableStateOf<List<SignalReading>>(emptyList()) }
-        var isLoading by remember { mutableStateOf(true) }
+        var readings     by remember { mutableStateOf<List<SignalReading>>(emptyList()) }
+        var isLoading    by remember { mutableStateOf(true) }
         var readingCount by remember { mutableStateOf(0) }
+        var mapViewRef   by remember { mutableStateOf<MapView?>(null) }
+        var myLocOverlay by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
 
+        // Load from Firebase — live listener updates map as new data arrives
         LaunchedEffect(Unit) {
             val db = FirebaseDatabase
                 .getInstance("https://signalsense-bcc2d-default-rtdb.firebaseio.com/")
@@ -70,9 +78,15 @@ class HeatmapActivity : ComponentActivity() {
                             }
                         }
                     }
-                    readings = list
+                    readings     = list.sortedBy { it.timestamp }
                     readingCount = list.size
-                    isLoading = false
+                    isLoading    = false
+
+                    // Center map on latest reading
+                    if (list.isNotEmpty()) {
+                        val last = list.last()
+                        mapViewRef?.controller?.animateTo(GeoPoint(last.lat, last.lng))
+                    }
                 }
                 override fun onCancelled(error: DatabaseError) {
                     isLoading = false
@@ -83,27 +97,34 @@ class HeatmapActivity : ComponentActivity() {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xFF1A1A2E))
+                .background(Color(0xFF020617))
         ) {
             // Top bar
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF16213E))
+                    .background(Color(0xFF0F172A))
                     .padding(14.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { finish() }) {
+                        Text(text = "←", color = Color(0xFF94A3B8), fontSize = 20.sp)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "SIGNAL HEATMAP",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 2.sp,
+                        color = Color(0xFF22D3EE)
+                    )
+                }
                 Text(
-                    text = "Signal Heatmap",
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-                Text(
-                    text = "$readingCount readings",
-                    fontSize = 12.sp,
-                    color = Color(0xFF9E9E9E)
+                    text = "$readingCount pts",
+                    fontSize = 11.sp,
+                    color = Color(0xFF94A3B8)
                 )
             }
 
@@ -115,8 +136,8 @@ class HeatmapActivity : ComponentActivity() {
                         contentAlignment = Alignment.Center
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(color = Color(0xFF4CAF50))
-                            Spacer(modifier = Modifier.height(12.dp))
+                            CircularProgressIndicator(color = Color(0xFF22D3EE))
+                            Spacer(Modifier.height(12.dp))
                             Text("Loading signal data...", color = Color.White)
                         }
                     }
@@ -126,17 +147,37 @@ class HeatmapActivity : ComponentActivity() {
                             MapView(ctx).apply {
                                 setTileSource(TileSourceFactory.MAPNIK)
                                 setMultiTouchControls(true)
-                                controller.setZoom(16.0)
+                                controller.setZoom(18.0) // zoomed in more for precision
                                 controller.setCenter(GeoPoint(12.9716, 77.5946))
+
+                                // ── Blue dot showing YOUR current location ──
+                                val locationOverlay = MyLocationNewOverlay(
+                                    GpsMyLocationProvider(ctx), this
+                                ).apply {
+                                    enableMyLocation()
+                                    enableFollowLocation()   // map follows you as you move
+                                    runOnFirstFix {
+                                        post {
+                                            controller.animateTo(myLocation)
+                                            controller.setZoom(18.0)
+                                        }
+                                    }
+                                }
+                                overlays.add(locationOverlay)
+                                myLocOverlay = locationOverlay
+                                mapViewRef = this
                             }
                         },
                         update = { mapView ->
-                            mapView.overlays.clear()
+                            // Remove old signal overlays but keep location overlay
+                            mapView.overlays.removeAll { it is Polygon || it is Marker }
+
+                            // Draw signal circles
                             readings.forEach { reading ->
                                 val circle = Polygon().apply {
                                     points = Polygon.pointsAsCircle(
                                         GeoPoint(reading.lat, reading.lng),
-                                        15.0
+                                        5.0  // 5 meter radius
                                     )
                                     fillPaint.apply {
                                         color = when (reading.zone) {
@@ -145,7 +186,7 @@ class HeatmapActivity : ComponentActivity() {
                                             "Dead Zone" -> android.graphics.Color.parseColor("#F44336")
                                             else        -> android.graphics.Color.parseColor("#9E9E9E")
                                         }
-                                        alpha = 80
+                                        alpha = 90
                                         style = android.graphics.Paint.Style.FILL
                                     }
                                     outlinePaint.apply {
@@ -155,18 +196,21 @@ class HeatmapActivity : ComponentActivity() {
                                             "Dead Zone" -> android.graphics.Color.parseColor("#F44336")
                                             else        -> android.graphics.Color.parseColor("#9E9E9E")
                                         }
-                                        alpha = 180
-                                        strokeWidth = 1.5f
+                                        alpha = 200
+                                        strokeWidth = 2f
                                     }
-                                    title = "${reading.zone} • ${reading.dbm} dBm • ${reading.network}"
+                                    title = "${reading.zone} • ${reading.dbm}dBm • ${reading.network}"
                                 }
                                 mapView.overlays.add(circle)
                             }
-                            if (readings.isNotEmpty()) {
-                                mapView.controller.setCenter(
-                                    GeoPoint(readings.last().lat, readings.last().lng)
-                                )
+
+                            // Re-add location overlay on top so it's always visible
+                            myLocOverlay?.let { overlay ->
+                                if (!mapView.overlays.contains(overlay)) {
+                                    mapView.overlays.add(overlay)
+                                }
                             }
+
                             mapView.invalidate()
                         }
                     )
@@ -177,13 +221,15 @@ class HeatmapActivity : ComponentActivity() {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF16213E))
+                    .background(Color(0xFF0F172A))
                     .padding(12.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 LegendItem(color = Color(0xFF4CAF50), label = "Strong")
                 LegendItem(color = Color(0xFFFFC107), label = "Weak")
                 LegendItem(color = Color(0xFFF44336), label = "Dead")
+                LegendItem(color = Color(0xFF2196F3), label = "You")
             }
         }
     }
@@ -192,14 +238,14 @@ class HeatmapActivity : ComponentActivity() {
     fun LegendItem(color: Color, label: String) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
         ) {
             Box(
                 modifier = Modifier
-                    .size(12.dp)
-                    .background(color, RoundedCornerShape(6.dp))
+                    .size(10.dp)
+                    .background(color, RoundedCornerShape(5.dp))
             )
-            Text(text = label, fontSize = 12.sp, color = Color.White)
+            Text(text = label, fontSize = 11.sp, color = Color(0xFF94A3B8))
         }
     }
 }

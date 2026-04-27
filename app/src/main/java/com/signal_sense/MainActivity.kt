@@ -1,7 +1,7 @@
 package com.signal_sense
 
-import android.content.Intent
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -19,61 +19,45 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
-import com.signal_sense.core.SignalAlert
-import com.signal_sense.core.SignalData
-import com.signal_sense.core.SignalMonitor
-import com.signal_sense.core.SignalMonitorService
-import com.signal_sense.core.SignalZone
+import com.signal_sense.core.*
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 // ── Colors ────────────────────────────────────────────────────────────────────
-val BgDark       = Color(0xFF020617)
-val BgCard       = Color(0xFF0F172A)
-val BgCardDeep   = Color(0xFF0E1A2B)
-val Accent       = Color(0xFF22D3EE)   // cyan
-val ColorStrong  = Color(0xFF22C55E)   // green
-val ColorWeak    = Color(0xFFEAB308)   // yellow
-val ColorDead    = Color(0xFFEF4444)   // red
-val ColorUnknown = Color(0xFF94A3B8)   // slate
-val TextMuted    = Color(0xFF94A3B8)
-val TextDim      = Color(0xFF475569)
-val TextBody     = Color(0xFFCBD5E1)
-val Divider      = Color(0xFF1E293B)
+private val BG_COLOR      = Color(0xFF020617)
+private val SURFACE_COLOR = Color(0xFF0F172A)
+private val ACCENT_COLOR  = Color(0xFF22D3EE)
+private val SLATE_COLOR   = Color(0xFF94A3B8)
+private val SLATE2_COLOR  = Color(0xFF475569)
+private val SLATE3_COLOR  = Color(0xFF1E293B)
+private val TEXT_COLOR    = Color(0xFFCBD5E1)
+private val DARK_COLOR    = Color(0xFF334155)
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-fun signalColor(zone: SignalZone): Color = when (zone) {
-    SignalZone.STRONG  -> ColorStrong
-    SignalZone.WEAK    -> ColorWeak
-    SignalZone.DEAD    -> ColorDead
-    SignalZone.UNKNOWN -> ColorUnknown
+private fun pctColor(pct: Int): Color = when {
+    pct <= 30 -> Color(0xFFEF4444)
+    pct <= 70 -> Color(0xFFEAB308)
+    else      -> Color(0xFF22C55E)
 }
 
-fun barColor(pct: Int): Color = when {
-    pct <= 30 -> ColorDead
-    pct <= 70 -> ColorWeak
-    else      -> ColorStrong
+private fun pctGlow(pct: Int): Color = when {
+    pct <= 30 -> Color(0xFFB91C1C)
+    pct <= 70 -> Color(0xFFCA8A04)
+    else      -> Color(0xFF16A34A)
 }
 
-// Derive zone + color from average of calls/payments/data
-fun avgZone(calls: Int, payments: Int, data: Int): Pair<SignalZone, Color> {
-    val avg = (calls + payments + data) / 3
-    return when {
-        avg <= 30 -> Pair(SignalZone.DEAD,   ColorDead)
-        avg <= 70 -> Pair(SignalZone.WEAK,   ColorWeak)
-        else      -> Pair(SignalZone.STRONG, ColorStrong)
-    }
+private fun pctLabel(pct: Int): String = when {
+    pct <= 30 -> "DEAD"
+    pct <= 70 -> "WEAK"
+    else      -> "STRONG"
 }
 
 // ── Activity ──────────────────────────────────────────────────────────────────
@@ -84,8 +68,14 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        if (results.values.all { it }) startMonitoring()
-        else Toast.makeText(this, "Permissions denied!", Toast.LENGTH_LONG).show()
+        val phoneGranted    = results[Manifest.permission.READ_PHONE_STATE] ?: false
+        val locationGranted = results[Manifest.permission.ACCESS_FINE_LOCATION]
+            ?: results[Manifest.permission.ACCESS_COARSE_LOCATION] ?: false
+        if (phoneGranted && locationGranted) startMonitoring()
+        else {
+            val denied = results.filter { !it.value }.keys.joinToString()
+            Toast.makeText(this, "Denied: $denied", Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -100,9 +90,9 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-
+        }
         val notGranted = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
@@ -116,29 +106,48 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             var data      by remember { mutableStateOf(SignalData()) }
-            var aiText    by remember { mutableStateOf("Analyzing signal...") }
-            var connTitle by remember { mutableStateOf("Checking...") }
-            var connDesc  by remember { mutableStateOf("Testing connectivity") }
+            var alertText by remember { mutableStateOf("") }
+            var callsPct  by remember { mutableStateOf(50) }
+            var payPct    by remember { mutableStateOf(50) }
+            var dataPct   by remember { mutableStateOf(50) }
+            var aiText    by remember { mutableStateOf("Analyzing signal…") }
 
             LaunchedEffect(Unit) {
-                launch { monitor.signalFlow.collectLatest    { data = it } }
-                launch { monitor.connectivityDesc.collectLatest { (t, d) -> connTitle = t; connDesc = d } }
                 launch {
-                    monitor.alertFlow.collectLatest { a ->
-                        aiText = if (a != null) {
-                            "${a.title}: ${a.message}"
-                        } else {
-                            when (data.zone) {
-                                SignalZone.STRONG  -> "Signal is excellent. Stay here for calls, payments, and streaming."
-                                SignalZone.WEAK    -> "Signal is weak. Move toward an open area to improve signal."
-                                SignalZone.DEAD    -> "Dead zone. Move at least 50 metres toward the main road."
-                                SignalZone.UNKNOWN -> "Analyzing signal strength..."
+                    monitor.signalFlow.collectLatest { d ->
+                        data = d
+                        when (d.zone) {
+                            SignalZone.STRONG -> {
+                                callsPct = (85..98).random()
+                                payPct   = (82..95).random()
+                                dataPct  = (88..99).random()
+                                aiText   = "Signal is excellent. You're in the best spot — stay here for calls, payments, and streaming."
+                            }
+                            SignalZone.WEAK -> {
+                                callsPct = (40..65).random()
+                                payPct   = (38..62).random()
+                                dataPct  = (45..70).random()
+                                aiText   = "Signal is weak. Move 20 metres toward an open area to improve signal by ~40%."
+                            }
+                            SignalZone.DEAD -> {
+                                callsPct = (5..20).random()
+                                payPct   = (3..15).random()
+                                dataPct  = (5..18).random()
+                                aiText   = "Dead zone detected. Move at least 50 metres toward the main road for usable signal."
+                            }
+                            SignalZone.UNKNOWN -> {
+                                callsPct = 50; payPct = 50; dataPct = 50
+                                aiText   = "Analyzing signal…"
                             }
                         }
                     }
                 }
-
-                     else -> "Monitoring signal..."
+                launch {
+                    monitor.alertFlow.collectLatest { a ->
+                        alertText = when (a) {
+                            is SignalAlert.SignalRestored -> ""
+                            null -> ""
+                            else -> "${a.title}: ${a.message}"
                         }
                     }
                 }
@@ -146,6 +155,10 @@ class MainActivity : ComponentActivity() {
 
             SignalSenseUI(
                 data           = data,
+                alertText      = alertText,
+                callsPct       = callsPct,
+                payPct         = payPct,
+                dataPct        = dataPct,
                 aiText         = aiText,
                 onHeatmapClick = {
                     startActivity(Intent(this@MainActivity, HeatmapActivity::class.java))
@@ -154,48 +167,98 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onDestroy() { monitor.stop(); super.onDestroy() }
+    override fun onDestroy() {
+        monitor.stop()
+        super.onDestroy()
+    }
 }
 
-// ── Main UI ───────────────────────────────────────────────────────────────────
+// ── Main Screen ───────────────────────────────────────────────────────────────
 @Composable
 fun SignalSenseUI(
     data: SignalData,
+    alertText: String,
+    callsPct: Int,
+    payPct: Int,
+    dataPct: Int,
     aiText: String,
     onHeatmapClick: () -> Unit = {}
 ) {
-    // Derive circle color from avg of calls/payments/data if available
-    val calls    = data.callQuality    // Int 0–100 (add to SignalData if needed)
-    val payments = data.paymentQuality // Int 0–100
-    val dataQ    = data.dataQuality    // Int 0–100
-    val (_, circleColor) = avgZone(calls, payments, dataQ)
-    val zoneColor = signalColor(data.zone)
+    val avg          = (callsPct + payPct + dataPct) / 3
+    val circleColor  = pctColor(avg)
+    val glowColor    = pctGlow(avg)
+    val circleLabel  = pctLabel(avg)
 
-    var showAdvanced by remember { mutableStateOf(false) }
+    // Pulse flash every 5 seconds
+    var pulse by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(5000)
+            pulse = true
+            delay(600)
+            pulse = false
+        }
+    }
 
-    // Pulse animation
-    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-    val pulse1 by infiniteTransition.animateFloat(
-        initialValue = 1f, targetValue = 1.6f,
-        animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Restart),
-        label = "p1"
+    // Ring 1 animation
+    val infiniteRing1 = rememberInfiniteTransition(label = "ring1")
+    val ring1Scale by infiniteRing1.animateFloat(
+        initialValue = 1f,
+        targetValue  = 1.65f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "ring1scale"
     )
-    val pulse2 by infiniteTransition.animateFloat(
-        initialValue = 1f, targetValue = 1.6f,
-        animationSpec = infiniteRepeatable(tween(1800, 600, easing = LinearEasing), RepeatMode.Restart),
-        label = "p2"
+    val ring1Alpha by infiniteRing1.animateFloat(
+        initialValue = 0.6f,
+        targetValue  = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "ring1alpha"
     )
+
+    // Ring 2 animation — delayed
+    val infiniteRing2 = rememberInfiniteTransition(label = "ring2")
+    val ring2Scale by infiniteRing2.animateFloat(
+        initialValue = 1f,
+        targetValue  = 1.65f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1800, easing = FastOutSlowInEasing, delayMillis = 650),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "ring2scale"
+    )
+    val ring2Alpha by infiniteRing2.animateFloat(
+        initialValue = 0.6f,
+        targetValue  = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1800, easing = FastOutSlowInEasing, delayMillis = 650),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "ring2alpha"
+    )
+
+    // Animated bars
+    val callsAnim by animateIntAsState(targetValue = callsPct, animationSpec = tween(1000), label = "calls")
+    val payAnim   by animateIntAsState(targetValue = payPct,   animationSpec = tween(1000), label = "pay")
+    val dataAnim  by animateIntAsState(targetValue = dataPct,  animationSpec = tween(1000), label = "data")
+
+    var showModal by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(BgDark)
+            .background(BG_COLOR)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 28.dp),
+                .padding(horizontal = 20.dp, vertical = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
 
@@ -204,204 +267,283 @@ fun SignalSenseUI(
                 text = "SignalSense",
                 fontSize = 26.sp,
                 fontWeight = FontWeight.Bold,
-                color = Accent,
-                letterSpacing = 4.sp
+                letterSpacing = 4.sp,
+                color = ACCENT_COLOR
             )
+            Spacer(Modifier.height(4.dp))
             Text(
                 text = "AI SIGNAL ANALYZER",
                 fontSize = 10.sp,
-                color = TextDim,
                 letterSpacing = 3.sp,
-                modifier = Modifier.padding(top = 4.dp, bottom = 26.dp)
+                color = DARK_COLOR
             )
 
-            // ── Signal Circle ─────────────────────────────────────────────────
+            Spacer(Modifier.height(24.dp))
+
+            // ── Signal Circle with two pulsing rings ──────────────────────────
             Box(
                 contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(160.dp)
-                    .padding(bottom = 0.dp)
+                modifier = Modifier.size(190.dp)
             ) {
-                // Pulse ring 1
+                // Ring 1
                 Box(
                     modifier = Modifier
                         .size(160.dp)
-                        .scale(pulse1)
-                        .clip(CircleShape)
-                        .border(2.dp, circleColor.copy(alpha = (1f - (pulse1 - 1f) / 0.6f).coerceIn(0f,1f)), CircleShape)
+                        .drawBehind {
+                            drawCircle(
+                                color  = circleColor.copy(alpha = ring1Alpha),
+                                radius = (size.minDimension / 2f) * ring1Scale,
+                                style  = Stroke(width = 2.dp.toPx())
+                            )
+                        }
                 )
-                // Pulse ring 2
+                // Ring 2
                 Box(
                     modifier = Modifier
                         .size(160.dp)
-                        .scale(pulse2)
-                        .clip(CircleShape)
-                        .border(2.dp, circleColor.copy(alpha = (1f - (pulse2 - 1f) / 0.6f).coerceIn(0f,1f)), CircleShape)
+                        .drawBehind {
+                            drawCircle(
+                                color  = circleColor.copy(alpha = ring2Alpha),
+                                radius = (size.minDimension / 2f) * ring2Scale,
+                                style  = Stroke(width = 2.dp.toPx())
+                            )
+                        }
                 )
                 // Main filled circle
                 Box(
-                    contentAlignment = Alignment.Center,
                     modifier = Modifier
                         .size(144.dp)
                         .clip(CircleShape)
                         .background(
                             Brush.radialGradient(
-                                listOf(circleColor, circleColor.copy(alpha = 0.6f))
+                                colors = listOf(circleColor, glowColor)
                             )
-                        )
+                        ),
+                    contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            text = "SIGNAL",
+                            text  = "SIGNAL",
                             fontSize = 10.sp,
                             color = Color.White.copy(alpha = 0.6f),
                             letterSpacing = 2.sp
                         )
+                        Spacer(Modifier.height(4.dp))
                         Text(
-                            text = data.zone.label,
+                            text  = circleLabel,
                             fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White,
-                            letterSpacing = 1.sp
+                            fontWeight = FontWeight.Black,
+                            color = Color.White
                         )
                     }
+                }
+                // Pulse flash overlay
+                if (pulse) {
+                    Box(
+                        modifier = Modifier
+                            .size(144.dp)
+                            .clip(CircleShape)
+                            .background(Color.White.copy(alpha = 0.12f))
+                    )
                 }
             }
 
             Spacer(Modifier.height(24.dp))
 
-            // ── Connectivity Card ─────────────────────────────────────────────
-            SectionCard {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(Accent)
+            // ── Connectivity Bars ─────────────────────────────────────────────
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors   = CardDefaults.cardColors(containerColor = SURFACE_COLOR),
+                shape    = RoundedCornerShape(16.dp),
+                border   = BorderStroke(1.dp, ACCENT_COLOR.copy(alpha = 0.13f))
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(bottom = 14.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(ACCENT_COLOR)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "CONNECTIVITY",
+                            color = ACCENT_COLOR,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            letterSpacing = 2.sp
+                        )
+                    }
+                    MetricBarRow(label = "📞  Calls",    pct = callsAnim)
+                    MetricBarRow(label = "💳  Payments", pct = payAnim)
+                    MetricBarRow(label = "📡  Data",     pct = dataAnim)
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // ── AI Prediction ─────────────────────────────────────────────────
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors   = CardDefaults.cardColors(containerColor = SURFACE_COLOR),
+                shape    = RoundedCornerShape(16.dp),
+                border   = BorderStroke(1.dp, ACCENT_COLOR.copy(alpha = 0.13f))
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(bottom = 10.dp)
+                    ) {
+                        Text(text = "🤖", fontSize = 16.sp)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "AI PREDICTION",
+                            color = ACCENT_COLOR,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            letterSpacing = 2.sp
+                        )
+                    }
+                    Text(
+                        text       = aiText,
+                        color      = TEXT_COLOR,
+                        fontSize   = 14.sp,
+                        lineHeight = 24.sp
                     )
-                    Spacer(Modifier.width(8.dp))
-                    Text("CONNECTIVITY", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
                 }
-                Spacer(Modifier.height(14.dp))
-                MetricBar(label = "📞  Calls",    pct = calls)
-                MetricBar(label = "💳  Payments", pct = payments)
-                MetricBar(label = "📡  Data",     pct = dataQ)
             }
 
             Spacer(Modifier.height(14.dp))
 
-            // ── AI Prediction Card ────────────────────────────────────────────
-            SectionCard {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("🤖", fontSize = 16.sp)
-                    Spacer(Modifier.width(8.dp))
-                    Text("AI PREDICTION", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
-                }
-                Spacer(Modifier.height(10.dp))
-                Text(text = aiText, color = TextBody, fontSize = 14.sp, lineHeight = 22.sp)
-            }
-
-            Spacer(Modifier.height(14.dp))
-
-            // ── Advanced Metrics Button ───────────────────────────────────────
+            // ── Advanced Metrics Button ────────────────────────────────────────
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { showAdvanced = true },
-                colors = CardDefaults.cardColors(containerColor = BgCard),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, Accent.copy(alpha = 0.2f))
+                    .clickable { showModal = true },
+                colors = CardDefaults.cardColors(containerColor = SURFACE_COLOR),
+                shape  = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, ACCENT_COLOR.copy(alpha = 0.2f))
             ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 18.dp, vertical = 15.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("📊", fontSize = 16.sp)
+                        Text(text = "📊", fontSize = 16.sp)
                         Spacer(Modifier.width(10.dp))
-                        Text("ADVANCED METRICS", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+                        Text(
+                            text = "ADVANCED METRICS",
+                            color = ACCENT_COLOR,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            letterSpacing = 2.sp
+                        )
                     }
-                    Text("›", color = TextDim, fontSize = 22.sp)
+                    Text(
+                        text     = "›",
+                        color    = SLATE2_COLOR,
+                        fontSize = 22.sp
+                    )
                 }
             }
 
             Spacer(Modifier.height(14.dp))
 
-            // ── Heatmap Button ────────────────────────────────────────────────
-            Button(
-                onClick = onHeatmapClick,
+            // ── Heatmap Button ─────────────────────────────────────────────────
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(52.dp),
-                shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color.Transparent
-                ),
-                contentPadding = PaddingValues(0.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(
+                        Brush.horizontalGradient(
+                            colors = listOf(Color(0xFF0891B2), Color(0xFF0E7490))
+                        )
+                    )
+                    .clickable { onHeatmapClick() }
+                    .padding(vertical = 16.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(
-                            Brush.horizontalGradient(listOf(Color(0xFF0891B2), Color(0xFF0E7490))),
-                            RoundedCornerShape(14.dp)
-                        ),
-                    contentAlignment = Alignment.Center
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
                 ) {
+                    Text(text = "🗺️", fontSize = 16.sp)
+                    Spacer(Modifier.width(10.dp))
                     Text(
-                        text = "🗺️   SIGNAL HEATMAP",
+                        text = "SIGNAL HEATMAP",
                         color = Color.White,
-                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
                         letterSpacing = 3.sp
                     )
                 }
             }
+
+            // ── Alert box ─────────────────────────────────────────────────────
+            if (alertText.isNotEmpty()) {
+                Spacer(Modifier.height(14.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors   = CardDefaults.cardColors(containerColor = Color(0xFFEF4444)),
+                    shape    = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text     = alertText,
+                        color    = Color.White,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(14.dp)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Text(
+                text     = "Polling every 5 seconds",
+                fontSize = 10.sp,
+                color    = SLATE2_COLOR
+            )
         }
 
         // ── Advanced Metrics Modal ─────────────────────────────────────────────
-        if (showAdvanced) {
+        if (showModal) {
             AdvancedMetricsModal(
-                data       = data,
-                sigColor   = circleColor,
-                onDismiss  = { showAdvanced = false }
+                data      = data,
+                sigColor  = circleColor,
+                onDismiss = { showModal = false }
             )
         }
     }
 }
 
-// ── Section Card wrapper ──────────────────────────────────────────────────────
+// ── Metric Bar Row ────────────────────────────────────────────────────────────
 @Composable
-fun SectionCard(content: @Composable ColumnScope.() -> Unit) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = BgCard),
-        shape = RoundedCornerShape(16.dp),
-        border = BorderStroke(1.dp, Accent.copy(alpha = 0.13f))
-    ) {
-        Column(modifier = Modifier.padding(16.dp), content = content)
-    }
-}
-
-// ── Metric Bar ────────────────────────────────────────────────────────────────
-@Composable
-fun MetricBar(label: String, pct: Int) {
-    val color = barColor(pct)
-    val animPct by animateFloatAsState(
-        targetValue = pct / 100f,
-        animationSpec = tween(1000),
-        label = "bar"
-    )
+fun MetricBarRow(label: String, pct: Int) {
+    val color = pctColor(pct)
     Column(modifier = Modifier.padding(bottom = 11.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(label, color = TextMuted, fontSize = 13.sp)
-            Text("$pct%", color = color, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Text(
+                text      = label,
+                color     = SLATE_COLOR,
+                fontSize  = 13.sp,
+                letterSpacing = 1.sp
+            )
+            Text(
+                text       = "$pct%",
+                color      = color,
+                fontSize   = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
         }
         Spacer(Modifier.height(5.dp))
         Box(
@@ -409,16 +551,16 @@ fun MetricBar(label: String, pct: Int) {
                 .fillMaxWidth()
                 .height(8.dp)
                 .clip(RoundedCornerShape(99.dp))
-                .background(Divider)
+                .background(SLATE3_COLOR)
         ) {
             Box(
                 modifier = Modifier
-                    .fillMaxWidth(animPct)
+                    .fillMaxWidth(fraction = pct / 100f)
                     .fillMaxHeight()
                     .clip(RoundedCornerShape(99.dp))
                     .background(
                         Brush.horizontalGradient(
-                            listOf(color.copy(alpha = 0.5f), color)
+                            colors = listOf(color.copy(alpha = 0.53f), color)
                         )
                     )
             )
@@ -426,42 +568,35 @@ fun MetricBar(label: String, pct: Int) {
     }
 }
 
-// ── Advanced Metrics Modal ────────────────────────────────────────────────────
+// ── Advanced Metrics Modal (bottom sheet style) ────────────────────────────────
 @Composable
 fun AdvancedMetricsModal(
     data: SignalData,
     sigColor: Color,
     onDismiss: () -> Unit
 ) {
-    val rows = listOf(
-        Triple("Signal Strength", "dBm",     "${data.dbm}"),
-        Triple("Signal Quality",  "SINR",    if (data.sinr.isNaN()) "N/A" else "${"%.1f".format(data.sinr)}"),
-        Triple("Stability Index", "RSRQ",    if (data.rsrq.isNaN()) "N/A" else "${"%.1f".format(data.rsrq)}"),
-        Triple("Network Type",    "",        data.networkLabel),
-    )
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.73f))
+            .clickable { onDismiss() },
+        contentAlignment = Alignment.BottomCenter
     ) {
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.BottomCenter
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    indication = null
+                ) { /* consume — don't dismiss */ },
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+            shape  = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+            border = BorderStroke(1.dp, ACCENT_COLOR.copy(alpha = 0.2f))
         ) {
-            // Scrim
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.7f))
-                    .clickable { onDismiss() }
-            )
-            // Sheet
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
-                    .background(BgCard)
-                    .padding(horizontal = 22.dp, vertical = 24.dp)
+                modifier = Modifier.padding(
+                    start = 22.dp, end = 22.dp, top = 24.dp, bottom = 36.dp
+                )
             ) {
                 // Handle
                 Box(
@@ -469,22 +604,36 @@ fun AdvancedMetricsModal(
                         .width(40.dp)
                         .height(4.dp)
                         .clip(RoundedCornerShape(99.dp))
-                        .background(TextDim)
+                        .background(Color(0xFF334155))
                         .align(Alignment.CenterHorizontally)
                 )
+
                 Spacer(Modifier.height(20.dp))
 
-                // Title
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("📊", fontSize = 16.sp)
+                    Text(text = "📊", fontSize = 16.sp)
                     Spacer(Modifier.width(8.dp))
-                    Text("ADVANCED METRICS", color = Accent, fontSize = 14.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+                    Text(
+                        text = "ADVANCED METRICS",
+                        color = ACCENT_COLOR,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        letterSpacing = 2.sp
+                    )
                 }
 
                 Spacer(Modifier.height(18.dp))
 
-                // Rows
-                rows.forEachIndexed { i, (label, unit, value) ->
+                val rows = listOf(
+                    Triple("Signal Strength", "dBm",  "${data.dbm}"),
+                    Triple("Signal Quality",  "SINR",
+                        if (data.sinr.isNaN()) "N/A" else "${"%.1f".format(data.sinr)}"),
+                    Triple("Stability Index", "RSRQ",
+                        if (data.rsrq.isNaN()) "N/A" else "${"%.1f".format(data.rsrq)}"),
+                    Triple("Network Type",    "",     data.networkLabel),
+                )
+
+                rows.forEachIndexed { index, (label, unit, value) ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -493,33 +642,81 @@ fun AdvancedMetricsModal(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column {
-                            Text(label, color = TextBody, fontSize = 14.sp)
-                            if (unit.isNotEmpty())
-                                Text(unit, color = TextDim, fontSize = 10.sp, letterSpacing = 2.sp)
+                            Text(
+                                text     = label,
+                                color    = TEXT_COLOR,
+                                fontSize = 14.sp
+                            )
+                            if (unit.isNotEmpty()) {
+                                Spacer(Modifier.height(2.dp))
+                                Text(
+                                    text          = unit,
+                                    color         = SLATE2_COLOR,
+                                    fontSize      = 10.sp,
+                                    letterSpacing = 2.sp
+                                )
+                            }
                         }
-                        // Network type uses Accent, others use signal color
-                        val valColor = if (i == 3) Accent else sigColor
-                        Text(value, color = valColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            text       = value,
+                            color      = if (unit.isEmpty()) ACCENT_COLOR else sigColor,
+                            fontSize   = 18.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
                     }
-                    if (i < rows.lastIndex)
-                        HorizontalDivider(color = Divider, thickness = 1.dp)
+                    if (index < rows.size - 1) {
+                        HorizontalDivider(color = Color(0xFF1E293B), thickness = 1.dp)
+                    }
                 }
 
                 Spacer(Modifier.height(22.dp))
 
                 // Close button
-                OutlinedButton(
-                    onClick = onDismiss,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, Accent.copy(alpha = 0.3f)),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(ACCENT_COLOR.copy(alpha = 0.09f))
+                        .border(
+                            1.dp,
+                            ACCENT_COLOR.copy(alpha = 0.27f),
+                            RoundedCornerShape(12.dp)
+                        )
+                        .clickable { onDismiss() }
+                        .padding(vertical = 13.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Text("CLOSE", letterSpacing = 2.sp, fontSize = 12.sp)
+                    Text(
+                        text          = "CLOSE",
+                        color         = ACCENT_COLOR,
+                        fontSize      = 12.sp,
+                        fontWeight    = FontWeight.Bold,
+                        letterSpacing = 2.sp
+                    )
                 }
-
-                Spacer(Modifier.height(16.dp))
             }
+        }
+    }
+}
+
+// ── MetricCard (kept for compatibility) ──────────────────────────────────────
+@Composable
+fun MetricCard(label: String, value: String) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+        shape  = RoundedCornerShape(12.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text       = value,
+                fontSize   = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color      = Color.White
+            )
+            Text(text = label, fontSize = 10.sp, color = Color(0xFF9E9E9E))
         }
     }
 }
